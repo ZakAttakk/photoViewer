@@ -333,8 +333,8 @@ class PhotoViewer:
                   activeforeground=BTN_ACTIVE_FG, relief=tk.FLAT, bd=0,
                   font=("Segoe UI", 10), cursor="hand2").pack(fill=tk.BOTH, expand=True)
 
-        pbtn(content, "Clear Strokes", self._clear_retouch).pack(
-            fill=tk.X, padx=14, pady=(0, 10))
+        self._btn_clear_strokes = pbtn(content, "Clear Strokes", self._clear_retouch)
+        self._btn_bake_retouch  = pbtn(content, "Bake into Image", self._bake_retouch)
 
         # ── Bottom buttons ────────────────────────────────────────────────────
 
@@ -665,7 +665,7 @@ class PhotoViewer:
             self._cancel_crop()
         if self._retouch_active:
             self._stop_retouch()
-        self._retouch_mask = None
+        self._set_retouch_mask(None)
         self.current_index = (self.current_index + direction) % len(self.folder_files)
         self._show_current()
 
@@ -761,7 +761,7 @@ class PhotoViewer:
 
 
     def _reset_edits(self):
-        self._retouch_mask = None
+        self._set_retouch_mask(None)
         for var in self._edit_vars.values():
             var.set(0)
         if self.current_file:
@@ -777,7 +777,7 @@ class PhotoViewer:
     def _save_edited_copy(self):
         if not self.current_file or not self.pil_image:
             return
-        edited = self._apply_edits(self.pil_image)   # full-res processing for save
+        edited = self._apply_edits(self.pil_image, high_quality_retouch=True)   # full-res, no softening
         if edited.mode != "RGB":
             edited = edited.convert("RGB")
         p    = Path(self.current_file)
@@ -787,9 +787,30 @@ class PhotoViewer:
                 edited.save(str(dest), quality=95)
             else:
                 edited.save(str(dest))
-            messagebox.showinfo("Saved", f"Saved as:\n{dest}")
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
+            return
+
+        # Ask if they want to open the saved copy (sharp, no preview softening)
+        open_it = messagebox.askyesno(
+            "Saved",
+            f"Saved as:\n{dest}\n\nOpen saved copy?")
+        if open_it:
+            dest_str = str(dest)
+            folder   = str(dest.parent)
+            self.folder_files = sorted(
+                [os.path.join(folder, f) for f in os.listdir(folder)
+                 if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"))],
+                key=lambda x: x.lower())
+            if dest_str in self.folder_files:
+                self.current_index = self.folder_files.index(dest_str)
+            else:
+                self.folder_files.insert(0, dest_str)
+                self.current_index = 0
+            if self._retouch_active:
+                self._stop_retouch()
+            self._set_retouch_mask(None)
+            self._show_current()
 
     # ─────────────────────────────────────────── edit: image processing ──
 
@@ -798,7 +819,7 @@ class PhotoViewer:
         """Build a 256-entry integer lookup table from a function i → value."""
         return [max(0, min(255, int(fn(i)))) for i in range(256)]
 
-    def _apply_edits(self, img: Image.Image) -> Image.Image:
+    def _apply_edits(self, img: Image.Image, high_quality_retouch: bool = False) -> Image.Image:
         v = {k: var.get() for k, var in self._edit_vars.items()}
 
         if img.mode != "RGB":
@@ -882,7 +903,7 @@ class PhotoViewer:
 
         # ── Retouch (dodge/burn) ──────────────────────────────────────────────
         if self._retouch_mask is not None:
-            img = self._apply_retouch(img)
+            img = self._apply_retouch(img, high_quality=high_quality_retouch)
 
         return img
 
@@ -913,8 +934,35 @@ class PhotoViewer:
         self.btn_dodge.config(bg=BTN_BG, fg=BTN_FG)
         self.btn_burn.config( bg=BTN_BG, fg=BTN_FG)
 
+    def _set_retouch_mask(self, mask):
+        """Set _retouch_mask and show/hide the Clear/Bake buttons accordingly."""
+        self._retouch_mask = mask
+        if mask is None:
+            self._btn_clear_strokes.pack_forget()
+            self._btn_bake_retouch.pack_forget()
+        else:
+            self._btn_clear_strokes.pack(fill=tk.X, padx=14, pady=(0, 6))
+            self._btn_bake_retouch.pack( fill=tk.X, padx=14, pady=(0, 10))
+
     def _clear_retouch(self):
-        self._retouch_mask = None
+        self._set_retouch_mask(None)
+        self._render()
+
+    def _bake_retouch(self):
+        """Permanently apply the retouch mask into self.pil_image at full quality."""
+        if self._retouch_mask is None or self.pil_image is None:
+            return
+        if self._retouch_active:
+            self._stop_retouch()
+        self.root.config(cursor="wait")
+        self.root.update_idletasks()
+        try:
+            baked = self._apply_retouch(self.pil_image, high_quality=True)
+            self.pil_image = baked
+            self._cache[self.current_file] = baked
+            self._set_retouch_mask(None)
+        finally:
+            self.root.config(cursor="")
         self._render()
 
     def _update_retouch_cursor(self, wx, wy):
@@ -963,8 +1011,8 @@ class PhotoViewer:
         if self._retouch_mask is None:
             iw, ih = self.pil_image.size
             s = self._retouch_mask_scale()
-            self._retouch_mask = np.zeros(
-                (max(1, int(ih * s)), max(1, int(iw * s))), dtype=np.float32)
+            self._set_retouch_mask(np.zeros(
+                (max(1, int(ih * s)), max(1, int(iw * s))), dtype=np.float32))
 
     def _paint_at(self, ix, iy):
         """Stamp a soft Gaussian brush at image coordinate (ix, iy)."""
@@ -995,24 +1043,39 @@ class PhotoViewer:
         self._retouch_mask[by0:by1, bx0:bx1] = np.clip(
             self._retouch_mask[by0:by1, bx0:bx1] + delta, -1.0, 1.0)
 
-    def _apply_retouch(self, img: Image.Image) -> Image.Image:
+    # If the image has more pixels than this, downsample it before numpy ops.
+    # At fit mode a 6048×4048 image displays at ~1.7 M px — well under this limit,
+    # so no roundtrip and no softening.  At 100 % zoom it's 24 M px — over the
+    # limit, so we downsample, which is fast and the slight softness is acceptable
+    # for a dodge/burn effect.
+    _RETOUCH_NUMPY_MAX_PX = 2_500_000
+
+    def _apply_retouch(self, img: Image.Image, high_quality: bool = False) -> Image.Image:
         """Apply the accumulated dodge/burn mask to img."""
         mh, mw = self._retouch_mask.shape
         iw, ih = img.size
-        # Always work at mask resolution — numpy ops on a 1500px image are ~16x
-        # faster than on a 6048px image. Upscale the result back if needed.
-        if (iw, ih) != (mw, mh):
-            work = img.resize((mw, mh), Image.BILINEAR)
-            upscale_to = (iw, ih)
-        else:
-            work = img
+
+        if high_quality or iw * ih <= self._RETOUCH_NUMPY_MAX_PX:
+            # Upscale mask to image size — no image roundtrip, no softening
+            if (iw, ih) != (mw, mh):
+                mask = np.array(
+                    Image.fromarray(self._retouch_mask, mode="F")
+                    .resize((iw, ih), Image.BILINEAR))
+            else:
+                mask = self._retouch_mask
+            arr = np.array(img, dtype=np.float32)
             upscale_to = None
-        arr  = np.array(work, dtype=np.float32)
-        mask = self._retouch_mask[:, :, np.newaxis]
+        else:
+            # Image is too large for live preview — downsample to mask size, apply, upscale result
+            arr = np.array(img.resize((mw, mh), Image.BILINEAR), dtype=np.float32)
+            mask = self._retouch_mask
+            upscale_to = (iw, ih)
+
+        mask = mask[:, :, np.newaxis]
         pos  = np.maximum(mask,  0)
         neg  = np.maximum(-mask, 0)
-        dodge_weight = np.sqrt(1.0 - arr / 255.0)
-        burn_weight  = np.sqrt(arr / 255.0)
+        dodge_weight = 1.0 - arr / 255.0
+        burn_weight  = arr / 255.0
         arr  = arr + (255.0 - arr) * pos * dodge_weight - arr * neg * burn_weight
         result = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
         if upscale_to:
@@ -1254,7 +1317,7 @@ class PhotoViewer:
         cropped = self.pil_image.crop((x0, y0, x1, y1))
         self.pil_image = cropped
         self._cache[self.current_file] = cropped
-        self._retouch_mask = None  # image dimensions changed
+        self._set_retouch_mask(None)  # image dimensions changed
 
         w, h = cropped.size
         name = os.path.basename(self.current_file)
