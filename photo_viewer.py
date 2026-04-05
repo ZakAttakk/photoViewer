@@ -357,7 +357,7 @@ class PhotoViewer:
         var = tk.IntVar(value=0)
         self._edit_vars[key] = var
 
-        # Label row
+        # Label row: [Label] … [↺] [value]
         row = tk.Frame(parent, bg=PANEL_BG)
         row.pack(fill=tk.X, padx=14, pady=(6, 0))
         tk.Label(row, text=label, bg=PANEL_BG, fg=BTN_FG,
@@ -365,9 +365,28 @@ class PhotoViewer:
         tk.Label(row, textvariable=var, bg=PANEL_BG, fg=LABEL_FG,
                  font=("Segoe UI", 11), width=4, anchor="e").pack(side=tk.RIGHT)
 
-        # Slider row with − and + buttons
-        def dec(): var.set(max(mn, var.get() - 1)); self._schedule_edit_render()
-        def inc(): var.set(min(mx, var.get() + 1)); self._schedule_edit_render()
+        # Per-slider reset button — invisible when at 0, clickable when not
+        reset_lbl = tk.Label(row, text="↺", bg=PANEL_BG, fg=PANEL_BG,
+                             font=("Segoe UI", 10), width=2)
+        reset_lbl.pack(side=tk.RIGHT, padx=(0, 2))
+
+        def _reset(e=None):
+            var.set(0)
+            self._schedule_edit_render()
+
+        def _update_reset(*_):
+            if var.get() != 0:
+                reset_lbl.config(fg="#888888", cursor="hand2")
+                reset_lbl.bind("<Button-1>", _reset)
+            else:
+                reset_lbl.config(fg=PANEL_BG, cursor="")
+                reset_lbl.unbind("<Button-1>")
+
+        var.trace_add("write", _update_reset)
+
+        # Slider row with − and + buttons (±2 per click)
+        def dec(): var.set(max(mn, var.get() - 2)); self._schedule_edit_render()
+        def inc(): var.set(min(mx, var.get() + 2)); self._schedule_edit_render()
 
         sl_row = tk.Frame(parent, bg=PANEL_BG)
         sl_row.pack(fill=tk.X, padx=14, pady=(2, 0))
@@ -829,32 +848,46 @@ class PhotoViewer:
         else:
             img = img.copy()
 
-        # ── Tone: black point / white point / shadows / highlights (single LUT pass) ──
+        # ── Tone: Lightroom-style parametric zone adjustments ───────────────
         bp = v["black_point"]
         wp = v["white_point"]
         sh = v["shadows"]
         hl = v["highlights"]
         if any((bp, wp, sh, hl)):
             def tone(i):
-                x = float(i)
-                # black point: positive lifts blacks, negative crushes them
-                if bp: x += bp * 1.28 * (1.0 - x / 255)
-                # white point: positive boosts whites, negative pulls them down
-                if wp: x += wp * 1.28 * (x / 255)
-                # shadows: affects lower ¾ of tonal range
-                if sh: x += sh * 0.8 * max(0.0, 1.0 - x / 192) ** 0.5
-                # highlights: affects upper ¾ of tonal range
-                if hl: x += hl * 0.8 * max(0.0, (x - 64) / 191) ** 0.5
-                return x
+                t = i / 255.0
+                # Blacks: quadratic weight, heaviest at t=0, zero at t=0.5
+                if bp:
+                    w = max(0.0, (0.5 - t) / 0.5) ** 2.0
+                    t += (bp / 100.0) * w * 0.25
+                # Whites: quadratic weight, heaviest at t=1, zero at t=0.5
+                if wp:
+                    w = max(0.0, (t - 0.5) / 0.5) ** 2.0
+                    t += (wp / 100.0) * w * 0.25
+                # Shadows: sqrt weight, broad lower-half adjustment
+                if sh:
+                    w = max(0.0, (0.5 - t) / 0.5) ** 0.5
+                    t += (sh / 100.0) * w * 0.30
+                # Highlights: sqrt weight, broad upper-half adjustment
+                if hl:
+                    w = max(0.0, (t - 0.5) / 0.5) ** 0.5
+                    t += (hl / 100.0) * w * 0.30
+                return t * 255
             img = img.point(self._lut(tone) * 3)
 
-        # ── Brightness ──────────────────────────────────────────────────────
+        # ── Brightness: gamma-based exposure adjustment ──────────────────────
         if v["brightness"]:
-            img = ImageEnhance.Brightness(img).enhance(max(0.01, 1 + v["brightness"] / 100))
+            b     = v["brightness"] / 100.0
+            gamma = 1.0 - b * 0.5        # +100 → γ=0.5 (brighter), −100 → γ=1.5 (darker)
+            img   = img.point(self._lut(lambda i: (i / 255.0) ** gamma * 255) * 3)
 
-        # ── Contrast ────────────────────────────────────────────────────────
+        # ── Contrast: S-curve around midpoint ───────────────────────────────
         if v["contrast"]:
-            img = ImageEnhance.Contrast(img).enhance(max(0.01, 1 + v["contrast"] / 100))
+            c = v["contrast"] / 100.0
+            def contrast_fn(i):
+                t = i / 255.0
+                return (t + c * 4 * t * (1 - t) * (t - 0.5)) * 255
+            img = img.point(self._lut(contrast_fn) * 3)
 
         # ── Saturation ──────────────────────────────────────────────────────
         if v["saturation"]:
