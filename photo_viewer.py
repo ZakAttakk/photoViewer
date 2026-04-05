@@ -303,7 +303,7 @@ class PhotoViewer:
 
         # Brush size row: label | value | − | +
         self._retouch_size_var = tk.IntVar(value=30)
-        br_row = tk.Frame(content, bg=PANEL_BG)
+        br_row = self._retouch_br_row = tk.Frame(content, bg=PANEL_BG)
         br_row.pack(fill=tk.X, padx=14, pady=(0, 8))
         tk.Label(br_row, text="Brush size", bg=PANEL_BG, fg=BTN_FG,
                  font=("Segoe UI", 11), anchor="w").pack(side=tk.LEFT)
@@ -810,6 +810,8 @@ class PhotoViewer:
             if self._retouch_active:
                 self._stop_retouch()
             self._set_retouch_mask(None)
+            for var in self._edit_vars.values():
+                var.set(0)
             self._show_current()
 
     # ─────────────────────────────────────────── edit: image processing ──
@@ -941,8 +943,8 @@ class PhotoViewer:
             self._btn_clear_strokes.pack_forget()
             self._btn_bake_retouch.pack_forget()
         else:
-            self._btn_clear_strokes.pack(fill=tk.X, padx=14, pady=(0, 6))
-            self._btn_bake_retouch.pack( fill=tk.X, padx=14, pady=(0, 10))
+            self._btn_clear_strokes.pack(fill=tk.X, padx=14, pady=(0, 6),  after=self._retouch_br_row)
+            self._btn_bake_retouch.pack( fill=tk.X, padx=14, pady=(0, 10), after=self._btn_clear_strokes)
 
     def _clear_retouch(self):
         self._set_retouch_mask(None)
@@ -1074,9 +1076,15 @@ class PhotoViewer:
         mask = mask[:, :, np.newaxis]
         pos  = np.maximum(mask,  0)
         neg  = np.maximum(-mask, 0)
+
+        # Brightness (dodge/burn)
         dodge_weight = 1.0 - arr / 255.0
         burn_weight  = arr / 255.0
-        arr  = arr + (255.0 - arr) * pos * dodge_weight - arr * neg * burn_weight
+        arr = arr + (255.0 - arr) * pos * dodge_weight - arr * neg * burn_weight
+
+        # Saturation: dodge adds ~25%, burn removes ~25%
+        lum = (0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2])[:,:,np.newaxis]
+        arr = arr + (pos - neg) * 0.25 * (arr - lum)
         result = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
         if upscale_to:
             result = result.resize(upscale_to, Image.BILINEAR)
